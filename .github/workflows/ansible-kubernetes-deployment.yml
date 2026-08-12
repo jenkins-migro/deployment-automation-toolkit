@@ -1,0 +1,164 @@
+name: Ansible Kubernetes Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      ip_address:
+        description: Target host IP address
+        required: true
+      nexus_url:
+        description: Nexus artifact URL
+        required: true
+      virtual_ipaddress:
+        description: Virtual IP address
+        required: true
+      metallb_ipaddress:
+        description: MetalLB IP address/range
+        required: true
+      virtual_router_id:
+        description: Virtual router ID
+        required: true
+      storage_class:
+        description: Kubernetes storage class
+        required: true
+      local_path_provisioner_path:
+        description: Local path provisioner directory
+        required: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  deploy:
+    name: Deploy Kubernetes artifact
+    runs-on: ubuntu-latest
+    env:
+      IP_ADDRESS: ${{ inputs.ip_address }}
+      NEXUS_URL: ${{ inputs.nexus_url }}
+      VIRTUAL_IPADDRESS: ${{ inputs.virtual_ipaddress }}
+      METALLLB_IPADDRESS: ${{ inputs.metallb_ipaddress }}
+      VIRTUAL_ROUTER_ID: ${{ inputs.virtual_router_id }}
+      STORAGE_CLASS: ${{ inputs.storage_class }}
+      LOCAL_PATH_PROVISIONER_PATH: ${{ inputs.local_path_provisioner_path }}
+      LINUX_USER: ${{ secrets.LINUX_USER }}
+      LINUX_PASS: ${{ secrets.LINUX_PASS }}
+      NEXUS_USER: ${{ secrets.NEXUS_USER }}
+      NEXUS_PASS: ${{ secrets.NEXUS_PASS }}
+      SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+    steps:
+      # actions/checkout v4 pinned to tag SHA 11d5960a326750d5838078e36cf38b85af677262.
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Install deployment tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ansible rsync sshpass
+
+      - name: Configure SSH
+        run: |
+          install -m 700 -d "$HOME/.ssh"
+          if [[ -n "$SSH_PRIVATE_KEY" ]]; then
+            printf '%s\n' "$SSH_PRIVATE_KEY" > "$HOME/.ssh/id_rsa"
+            chmod 600 "$HOME/.ssh/id_rsa"
+            ssh-keygen -y -f "$HOME/.ssh/id_rsa" > "$HOME/.ssh/id_rsa.pub"
+          fi
+          ssh-keygen -f "$HOME/.ssh/known_hosts" -R "$IP_ADDRESS" || true
+          ssh-keyscan -H "$IP_ADDRESS" >> "$HOME/.ssh/known_hosts"
+
+      - name: Prepare artifact installation files
+        run: |
+          cat > inventory <<EOF_INVENTORY
+          node1 ansible_host=$IP_ADDRESS ansible_user=$LINUX_USER ansible_password=$LINUX_PASS
+          EOF_INVENTORY
+
+          cat > hosts <<EOF_HOSTS
+          [local]
+          controller ansible_host=$IP_ADDRESS ansible_user=iadmin ansible_become=true ansible_connection=local
+
+          [k8s_masters:children]
+          local
+
+          [k8s_masters:vars]
+
+          [k8s_workers]
+          #k8s-2 ansible_host=10.0.1.19 new_hostname=k8s-2
+          #k8s-3 ansible_host=10.0.1.234 new_hostname=k8s-3
+
+          [k8s_workers:vars]
+          ansible_ssh_user=$LINUX_USER
+          ansible_become=true
+          ansible_connection=ssh
+          ansible_ssh_pass=$LINUX_PASS
+          ansible_sudo_pass=$LINUX_PASS
+
+          [all:children]
+          local
+          k8s_workers
+
+          [all:vars]
+          virtual_ipaddress=$VIRTUAL_IPADDRESS
+          metallb_ipaddress=$METALLLB_IPADDRESS
+          metallb_range=$METALLLB_IPADDRESS
+          dns_name=demo.centerity
+          virtual_router_id=$VIRTUAL_ROUTER_ID
+          docker_repository_name=localhost
+          storage_class=$STORAGE_CLASS
+          local_path_provisioner_directory=$LOCAL_PATH_PROVISIONER_PATH
+          EOF_HOSTS
+
+          artifact_name=$(basename "$NEXUS_URL")
+          cat > playbook_on_prem_isntallation.yaml <<EOF_PLAYBOOK
+          - name: Download artifact from nexus and unpack
+            gather_facts: yes
+            hosts: node1
+            become: yes
+            tasks:
+              - name: Set authorized key taken from file
+                ansible.posix.authorized_key:
+                  user: $LINUX_USER
+                  state: present
+                  key: "{{ lookup('file', '$HOME/.ssh/id_rsa.pub') }}"
+              - name: Download artifact
+                ansible.builtin.shell: "curl -u $NEXUS_USER:$NEXUS_PASS -X GET $NEXUS_URL --output /root/$artifact_name"
+              - name: Extract artifact into /root/
+                ansible.builtin.unarchive:
+                  src: /root/$artifact_name
+                  dest: /root/
+                  remote_src: yes
+              - name: Copy hosts file to artifact folder
+                ansible.builtin.copy:
+                  src: hosts
+                  dest: /root/devops/hosts
+                  owner: '1000'
+                  group: '1000'
+                  mode: '0644'
+          EOF_PLAYBOOK
+
+      - name: Prepare remote host
+        run: |
+          ansible-playbook -i inventory playbook_on_prem_isntallation.yaml
+
+          cat > dirty_hack.sh <<'EOF_DIRTY_HACK'
+          NOT_USED_BLOCK_DEVICES=$(lsblk -p | sed -E '/^\/dev\/[a-z]/{x;//s/ .*//p;x;};/^[a-z]|\/|]/h;$!d;x; /^\/dev\/[a-z]/s/ .*//' | grep 'sd[a-z]')
+          for i in $NOT_USED_BLOCK_DEVICES ; do
+            wipefs -fa $i
+            dd if=/dev/zero of=$i bs=512M count=10
+          done
+          EOF_DIRTY_HACK
+          chmod +x dirty_hack.sh
+          sshpass -p "$LINUX_PASS" rsync -av dirty_hack.sh "$LINUX_USER@$IP_ADDRESS:/root/"
+          sshpass -p "$LINUX_PASS" ssh "$LINUX_USER@$IP_ADDRESS" /root/dirty_hack.sh
+
+      - name: Run init-install.sh
+        run: sshpass -p "$LINUX_PASS" ssh "$LINUX_USER@$IP_ADDRESS" 'cd /root/devops/ ; ./init-install.sh'
+
+      - name: Run k8s-install.sh
+        run: sshpass -p "$LINUX_PASS" ssh "$LINUX_USER@$IP_ADDRESS" 'cd /root/devops/ ; ./k8s-install.sh'
+
+      - name: Run skipper.sh
+        run: sshpass -p "$LINUX_PASS" ssh "$LINUX_USER@$IP_ADDRESS" 'cd /root/devops/ ; ./skipper.sh -i docker-playbook/files/app-infra-images.tar.gz -a docker-playbook/files/app-images.tar.gz'

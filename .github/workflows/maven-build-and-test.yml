@@ -1,0 +1,90 @@
+name: Maven Build and Test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build-and-test:
+    name: Build and Test
+    runs-on: ubuntu-latest
+    env:
+      MAVEN_OPTS: -Xmx2048m
+    steps:
+      # actions/checkout v4 pinned to tag SHA 11d5960a326750d5838078e36cf38b85af677262.
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      # actions/setup-java v4 pinned to tag SHA cf277c60eb25467037889841efdb72551f06f6c3.
+      - name: Set up JDK 11 and Maven cache
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3
+        with:
+          distribution: temurin
+          java-version: '11'
+          cache: maven
+
+      - name: Restore Jenkins managed config files
+        env:
+          MAVEN_SETTINGS_XML: ${{ secrets.MAVEN_SETTINGS_XML }}
+          APP_CONFIG_PROPERTIES: ${{ secrets.APP_CONFIG_PROPERTIES }}
+        run: |
+          mkdir -p "$HOME/.m2" config
+          if [[ -n "$MAVEN_SETTINGS_XML" ]]; then
+            printf '%s' "$MAVEN_SETTINGS_XML" > "$HOME/.m2/settings.xml"
+          else
+            echo 'MAVEN_SETTINGS_XML secret is not configured; using default Maven settings.'
+          fi
+
+          if [[ -n "$APP_CONFIG_PROPERTIES" ]]; then
+            printf '%s' "$APP_CONFIG_PROPERTIES" > config/app.properties
+          else
+            echo 'APP_CONFIG_PROPERTIES secret is not configured; config/app.properties was not created.'
+          fi
+
+      - name: Environment setup
+        run: |
+          echo "Java version:"
+          java -version
+          echo "Maven version:"
+          mvn -version
+          mkdir -p target/reports target/logs
+          {
+            echo 'test.data.path=./test-data'
+            echo 'test.database.url=jdbc:h2:mem:testdb'
+          } > test.properties
+
+      - name: Compile
+        run: |
+          mvn clean compile \
+            -Dmaven.test.failure.ignore=true \
+            -Dcheckstyle.skip=false \
+            -Dfindbugs.skip=false
+
+      - name: Test
+        run: |
+          mvn test \
+            -Dmaven.test.failure.ignore=true \
+            -Dsurefire.useFile=false \
+            -Dtest.properties.file=./test.properties
+
+      - name: Publish test results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: surefire-reports
+          path: '**/target/surefire-reports/*.xml'
+          if-no-files-found: ignore
+
+      - name: Publish Maven site report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: maven-site-report
+          path: target/site
+          if-no-files-found: ignore
